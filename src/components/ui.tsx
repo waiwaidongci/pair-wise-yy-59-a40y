@@ -7,8 +7,8 @@ export function Button({ className = '', variant = 'primary', ...props }: Button
   return <button className={`button ${variant} ${className}`} {...props} />;
 }
 
-export function Badge({ children, tone = 'neutral' }: { children: ReactNode; tone?: 'neutral' | 'red' | 'amber' | 'green' | 'blue' }) {
-  return <span className={`badge ${tone}`}>{children}</span>;
+export function Badge({ children, tone = 'neutral', className = '' }: { children: ReactNode; tone?: 'neutral' | 'red' | 'amber' | 'green' | 'blue'; className?: string }) {
+  return <span className={`badge ${tone} ${className}`}>{children}</span>;
 }
 
 export function Card({ className = '', ...props }: HTMLAttributes<HTMLDivElement>) {

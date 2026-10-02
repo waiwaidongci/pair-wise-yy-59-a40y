@@ -21,21 +21,36 @@ import {
   Eye,
   FileCheck2,
   FileText,
+  GitMerge,
   Highlighter,
+  History,
   Layers3,
   Menu,
   PanelLeftClose,
+  RotateCw,
+  Scale,
   ScanSearch,
   ShieldCheck,
   Stamp,
   Tags,
-  UploadCloud
+  UploadCloud,
+  X
 } from 'lucide-react';
 import * as pdfjs from 'pdfjs-dist';
 import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
-import { Badge, Button, Card, Dialog, Tabs, X } from './components/ui';
-import { useDisclosureStore, type DisclosureRecord } from './store';
+import { Badge, Button, Card, Dialog, Tabs } from './components/ui';
+import {
+  STORAGE_KEY,
+  batchBlockers,
+  formatVersion,
+  reviewCheckDefs,
+  useDisclosureStore,
+  type Conflict,
+  type DisclosureRecord,
+  type DocVersion,
+  type Redaction
+} from './store';
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
@@ -47,6 +62,98 @@ const bundleQuery = async () => ({
   ]
 });
 
+function describeRegion(r: Redaction | null): string {
+  if (!r) return '（该侧已删除此区域）';
+  return `${r.reason} · 第${r.page}页 · 坐标 ${Math.round(r.x * 100)}%,${Math.round(r.y * 100)}%`;
+}
+
+function describeFieldValue(field: string, value: unknown): string {
+  if (field === 'classification') return String(value);
+  if (field === 'decision') return value === 'passed' ? '通过' : value === 'rejected' ? '退回' : '待复核';
+  if (field === 'approvedVersion') return value ? formatVersion(value as DocVersion) : '未批准';
+  if (field.startsWith('check:')) return value ? '已勾选' : '未勾选';
+  if (typeof value === 'boolean') return value ? '是' : '否';
+  return String(value);
+}
+
+function fieldLabel(field: string): string {
+  if (field === 'classification') return '密级';
+  if (field === 'metadataCleaned') return '元数据清理';
+  if (field === 'decision') return '复核结论';
+  if (field === 'approvedVersion') return '批准版本';
+  if (field.startsWith('check:')) return `质检项 · ${reviewCheckDefs.find((c) => c.id === field.slice(6))?.label ?? field.slice(6)}`;
+  return field;
+}
+
+function ConflictCard({ conflict }: { conflict: Conflict }) {
+  const adjudicateRegion = useDisclosureStore((s) => s.adjudicateRegionConflict);
+  const adjudicateField = useDisclosureStore((s) => s.adjudicateFieldConflict);
+  if (conflict.kind === 'region') {
+    return (
+      <div className="conflict-item">
+        <div className="conflict-head"><Scale size={14} /><span>区域冲突 · {conflict.docId} · {conflict.regionId}</span></div>
+        <div className="conflict-sides">
+          <div className="conflict-side">
+            <strong>本侧（稍后保存）</strong>
+            <span>{describeRegion(conflict.local)}</span>
+            <Button variant="outline" onClick={() => adjudicateRegion(conflict.docId, conflict.regionId, 'local')}>采用本侧</Button>
+          </div>
+          <div className="conflict-side">
+            <strong>另一侧（先保存）</strong>
+            <span>{describeRegion(conflict.remote)}</span>
+            <Button variant="outline" onClick={() => adjudicateRegion(conflict.docId, conflict.regionId, 'remote')}>采用另一侧</Button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="conflict-item">
+      <div className="conflict-head"><Scale size={14} /><span>字段冲突 · {conflict.docId} · {fieldLabel(conflict.field)}</span></div>
+      <div className="conflict-sides">
+        <div className="conflict-side">
+          <strong>本侧</strong>
+          <span>{describeFieldValue(conflict.field, conflict.local)}</span>
+          <Button variant="outline" onClick={() => adjudicateField(conflict.docId, conflict.field, 'local')}>采用本侧</Button>
+        </div>
+        <div className="conflict-side">
+          <strong>另一侧</strong>
+          <span>{describeFieldValue(conflict.field, conflict.remote)}</span>
+          <Button variant="outline" onClick={() => adjudicateField(conflict.docId, conflict.field, 'remote')}>采用另一侧</Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MergeBanner() {
+  const mergeStatus = useDisclosureStore((s) => s.mergeStatus);
+  const conflicts = useDisclosureStore((s) => s.conflicts);
+  const mergeError = useDisclosureStore((s) => s.mergeError);
+  const retryMerge = useDisclosureStore((s) => s.retryMerge);
+  const restoreSnapshot = useDisclosureStore((s) => s.restoreSnapshot);
+  if (mergeStatus === 'idle') return null;
+  return (
+    <div className={`merge-banner ${mergeStatus}`}>
+      {mergeStatus === 'conflict' && (
+        <>
+          <div className="merge-banner-head"><GitMerge size={16} /><strong>检测到另一标签页与本侧同时修改</strong><span>同一区域两边都改过，已保留两份副本，等待裁决，期间批次不可标记可发布。</span></div>
+          <div className="conflict-list">{conflicts.map((c) => <ConflictCard key={`${c.kind}-${c.docId}-${c.kind === 'region' ? c.regionId : c.field}`} conflict={c} />)}</div>
+        </>
+      )}
+      {mergeStatus === 'failed' && (
+        <>
+          <div className="merge-banner-head"><AlertTriangle size={16} /><strong>合并或重算失败</strong><span>{mergeError ?? '结构校验未通过'}。已保留上一份可恢复快照，可重试或恢复。</span></div>
+          <div className="merge-banner-actions">
+            <Button variant="outline" onClick={retryMerge}><RotateCw size={15} /> 重试合并</Button>
+            <Button variant="outline" onClick={restoreSnapshot}><History size={15} /> 恢复上一份快照</Button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function AppShell() {
   const [mobileNav, setMobileNav] = useState(false);
   const links = [
@@ -55,6 +162,21 @@ function AppShell() {
     { to: '/quality', label: '发布质检', icon: ScanSearch },
     { to: '/batches', label: '批次与标签', icon: Tags }
   ];
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== STORAGE_KEY || !event.newValue) return;
+      try {
+        const parsed = JSON.parse(event.newValue);
+        const remote = parsed?.state;
+        if (!remote || !Array.isArray(remote.documents)) return;
+        useDisclosureStore.getState().applyRemoteState({ documents: remote.documents, batches: remote.batches ?? [] });
+      } catch {
+        /* ignore malformed remote */
+      }
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, []);
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -83,10 +205,10 @@ function AppShell() {
           </nav>
           <div className="sidebar-foot">
             <div><ShieldCheck size={16} /><span>审计记录已开启</span></div>
-            <small>草稿自动保存在本机</small>
+            <small>草稿自动保存在本机 · 多标签页合并</small>
           </div>
         </aside>
-        <main className="main-content"><Outlet /></main>
+        <main className="main-content"><MergeBanner /><Outlet /></main>
       </div>
     </div>
   );
@@ -100,7 +222,7 @@ function DocumentsPage() {
   return (
     <div className="page">
       <header className="page-heading">
-        <div><small>DISCLOSURE CONTROL / DOCUMENT SET</small><h1>披露文档集</h1><p>分批完成密级复核、敏感区域去密与发布版本比对。</p></div>
+        <div><small>DISCLOSURE CONTROL / DOCUMENT SET</small><h1>披露文档集</h1><p>分批完成密级复核、敏感区域去密与发布版本比对；内容改动后发布资格立即重算。</p></div>
         <Button><UploadCloud size={16} /> 导入文档集</Button>
       </header>
       <section className="summary-strip">
@@ -125,8 +247,8 @@ function DocumentsPage() {
                   <strong>{doc.title}</strong>
                   <span>{doc.id} · {doc.bundle} · {doc.size}</span>
                 </div>
+                <div className="doc-field"><span>版本</span><strong className="version-text">{formatVersion(doc.version)}</strong></div>
                 <div className="doc-field"><span>密级</span><Badge tone={doc.classification === '严格机密' ? 'red' : doc.classification === '机密' ? 'amber' : 'neutral'}>{doc.classification}</Badge></div>
-                <div className="doc-field"><span>负责人员</span><strong>{doc.owner}</strong></div>
                 <div className="doc-field"><span>状态</span><Badge tone={doc.status === '可发布' ? 'green' : doc.status === '待质检' ? 'amber' : 'blue'}>{doc.status}</Badge></div>
                 <div className="doc-actions">
                   <Link to="/review/$documentId" params={{ documentId: doc.id }}><Button variant="outline">审阅</Button></Link>
@@ -264,6 +386,7 @@ function ReviewPage() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [reason, setReason] = useState('商业秘密');
   const [privilege, setPrivilege] = useState('合同保密');
+  const stale = doc.review.decision === 'passed' && doc.review.approvedVersion && (doc.review.approvedVersion.major !== doc.version.major || doc.review.approvedVersion.minor !== doc.version.minor);
   return (
     <div className="page review-page">
       <header className="review-header">
@@ -271,6 +394,8 @@ function ReviewPage() {
           <Button variant="ghost" onClick={() => navigate({ to: '/' })}><ArrowLeft size={16} /></Button>
           <div><small>{doc.id} / 去密审阅</small><h1>{doc.title}</h1></div>
           <Badge tone={doc.classification === '严格机密' ? 'red' : 'amber'}>{doc.classification}</Badge>
+          <Badge tone="blue" className="version-badge">{formatVersion(doc.version)}</Badge>
+          {stale && <Badge tone="red">发布后已改动 · 需重新质检</Badge>}
         </div>
         <div className="review-actions">
           <Button variant="outline" onClick={() => store.toggleRedactionMode()} className={redactionMode ? 'active-button' : ''}><Highlighter size={16} /> {redactionMode ? '取消绘制' : '绘制去密区'}</Button>
@@ -335,7 +460,7 @@ function ReviewPage() {
             <Dialog.Description>系统将核对原始页与发布页的一致性，并检查元数据残留。</Dialog.Description>
             <div className="dialog-checks">
               <p><Check /> {doc.redactions.length} 个去密区域已定位</p>
-              <p><Check /> 文档版本与操作者记录完整</p>
+              <p><Check /> 文档版本 {formatVersion(doc.version)} · 操作者记录完整</p>
               <p className={doc.redactions.some((item) => item.status === 'draft') ? 'failed' : ''}><AlertTriangle /> {doc.redactions.some((item) => item.status === 'draft') ? '仍有未确认区域' : '所有区域已确认'}</p>
             </div>
             <Dialog.Close asChild><Button>返回检查 <X size={15} /></Button></Dialog.Close>
@@ -347,51 +472,125 @@ function ReviewPage() {
 }
 
 function QualityPage() {
-  const { documents } = useDisclosureStore();
+  const { documents, activeDocumentId } = useDisclosureStore();
   const store = useDisclosureStore();
-  const doc = documents[1];
-  const checks = [
-    { id: 'forbidden-terms', label: '全文禁词与姓名复核', detail: '扫描原始页和发布页文本层' },
-    { id: 'page-number', label: '页序与页码连续性', detail: '检查拆页、合并及漏页情况' },
-    { id: 'image-boundary', label: '图像边界残片', detail: '逐页比较遮蔽边界 2mm 区域' },
-    { id: 'metadata', label: '文档元数据清理', detail: '作者、修订人、批注和隐藏字段' }
-  ];
+  const doc = documents.find((d) => d.id === activeDocumentId) ?? documents[0];
+  const mergeStatus = useDisclosureStore((s) => s.mergeStatus);
+  const conflicts = useDisclosureStore((s) => s.conflicts);
+  const allChecks = reviewCheckDefs.every((check) => doc.review.checks[check.id]);
+  const allConfirmed = doc.redactions.length > 0 && doc.redactions.every((r) => r.status === 'confirmed');
+  const mergeBlocked = mergeStatus !== 'idle' || conflicts.length > 0;
+  const canApprove = !mergeBlocked && allChecks && doc.review.metadataCleaned && allConfirmed;
+  const docBlockers: string[] = [];
+  if (mergeStatus === 'failed') docBlockers.push('合并或重算失败，请先恢复快照或重试');
+  if (conflicts.length > 0) docBlockers.push(`存在 ${conflicts.length} 处冲突待裁决`);
+  if (!allConfirmed) docBlockers.push('仍有未确认去密区域');
+  if (!allChecks) docBlockers.push('质检项未全部勾选');
+  if (!doc.review.metadataCleaned) docBlockers.push('元数据未清理');
   return (
     <div className="page">
-      <header className="page-heading"><div><small>QUALITY ASSURANCE / SIDE-BY-SIDE</small><h1>发布质控双人复核</h1><p>并排检查原始页与发布页，所有差异必须留下复核结论。</p></div><Button><FileCheck2 size={16} /> 导出发布清单</Button></header>
+      <header className="page-heading"><div><small>QUALITY ASSURANCE / SIDE-BY-SIDE</small><h1>发布质检双人复核</h1><p>并排检查原始页与发布页，所有差异必须留下复核结论；结论改动后发布资格立即重算。</p></div><Button><FileCheck2 size={16} /> 导出发布清单</Button></header>
       <div className="comparison-banner">
-        <div><Eye size={17} /><strong>{doc.title}</strong><span>版本 3.4 · 双人复核</span></div>
-        <Badge tone="amber">等待复审员 2/2</Badge>
+        <div><Eye size={17} /><strong>{doc.title}</strong><span>{doc.id} · {formatVersion(doc.version)} · 双人复核</span></div>
+        <div className="banner-doc-select">
+          <select value={doc.id} onChange={(e) => store.selectDocument(e.target.value)}>
+            {documents.map((d) => <option key={d.id} value={d.id}>{d.id} · {d.title}</option>)}
+          </select>
+          <Badge tone={doc.review.decision === 'passed' ? 'green' : doc.review.decision === 'rejected' ? 'red' : 'amber'}>
+            {doc.review.decision === 'passed' ? '已通过' : doc.review.decision === 'rejected' ? '已退回' : '等待复核'}
+          </Badge>
+        </div>
       </div>
       <div className="compare-grid">
         <Card className="compare-panel"><div className="compare-head"><span>原始页</span><Badge tone="neutral">源文件</Badge></div><div className="compare-page"><PdfPage pageNumber={1} /></div></Card>
         <Card className="compare-panel"><div className="compare-head"><span>发布页</span><Badge tone="green">已遮蔽</Badge></div><div className="compare-page redacted-preview"><PdfPage pageNumber={1} redacted /><div className="demo-mask mask-one" /><div className="demo-mask mask-two" /></div></Card>
       </div>
       <div className="quality-bottom">
-        <Card className="checks-card"><div className="card-title"><ClipboardCheck size={17} /><strong>发布前校验项</strong></div>{checks.map((check) => <button className="check-row" key={check.id} onClick={() => store.toggleReviewCheck(check.id)}><span className={store.reviewChecks[check.id] ? 'checked' : ''}>{store.reviewChecks[check.id] && <Check size={13} />}</span><div><strong>{check.label}</strong><small>{check.detail}</small></div></button>)}</Card>
-        <Card className="decision-card"><div className="card-title"><ShieldCheck size={17} /><strong>复核结论</strong></div><p>本批次共有 <b>{doc.redactions.length}</b> 个去密区域，其中已确认 {doc.redactions.filter((item) => item.status === 'confirmed').length} 个。</p><label><input type="checkbox" checked={store.metadataCleaned} onChange={store.toggleMetadata} /> 已确认元数据清理</label><div className="decision-actions"><Button variant="outline"><ArrowLeft size={15} /> 退回补件</Button><Button disabled={!store.metadataCleaned || Object.values(store.reviewChecks).some((value) => !value)} onClick={store.markReady}><Check size={15} /> 通过并标记可发布</Button></div></Card>
+        <Card className="checks-card"><div className="card-title"><ClipboardCheck size={17} /><strong>发布前校验项</strong></div>{reviewCheckDefs.map((check) => <button className="check-row" key={check.id} onClick={() => store.toggleReviewCheck(doc.id, check.id)}><span className={doc.review.checks[check.id] ? 'checked' : ''}>{doc.review.checks[check.id] && <Check size={13} />}</span><div><strong>{check.label}</strong><small>{check.detail}</small></div></button>)}</Card>
+        <Card className="decision-card">
+          <div className="card-title"><ShieldCheck size={17} /><strong>复核结论</strong></div>
+          <p>本批次共有 <b>{doc.redactions.length}</b> 个去密区域，其中已确认 {doc.redactions.filter((item) => item.status === 'confirmed').length} 个。</p>
+          <label><input type="checkbox" checked={doc.review.metadataCleaned} onChange={() => store.toggleMetadata(doc.id)} /> 已确认元数据清理</label>
+          {docBlockers.length > 0 && (
+            <div className="blocker-list">
+              {docBlockers.map((b) => <p key={b}><AlertTriangle size={13} /> {b}</p>)}
+            </div>
+          )}
+          <div className="decision-actions">
+            <Button variant="outline" onClick={() => store.rejectDocument(doc.id)}><ArrowLeft size={15} /> 退回补件</Button>
+            <Button disabled={!canApprove} onClick={() => store.approveDocument(doc.id)}><Check size={15} /> 通过并标记可发布</Button>
+          </div>
+          {mergeBlocked && <p className="merge-gate-note">完整合并前不可标记可发布。</p>}
+        </Card>
       </div>
     </div>
   );
 }
 
 function BatchesPage() {
-  const { documents } = useDisclosureStore();
-  const [selected, setSelected] = useState<string[]>(['DOC-00418']);
-  const activeDoc = documents.find((doc) => doc.id === selected[0]) ?? documents[0];
+  const { documents, batches } = useDisclosureStore();
+  const mergeStatus = useDisclosureStore((s) => s.mergeStatus);
+  const conflicts = useDisclosureStore((s) => s.conflicts);
+  const [selectedBatchId, setSelectedBatchId] = useState(batches[0]?.id ?? 'BATCH-01');
+  const selectedBatch = batches.find((b) => b.id === selectedBatchId) ?? batches[0];
+  const batchDocs = selectedBatch.documentIds.map((id) => documents.find((d) => d.id === id)).filter((d): d is DisclosureRecord => Boolean(d));
+  const blockers = batchBlockers(selectedBatch, documents, mergeStatus, conflicts);
+  const canRelease = selectedBatch.releaseEligible && mergeStatus === 'idle' && conflicts.length === 0;
   return (
     <div className="page">
-      <header className="page-heading"><div><small>RELEASE BATCH / TAXONOMY</small><h1>发布批次与标签</h1><p>按案件问题、辖区和披露对象组织文档，生成可追溯发布清单。</p></div><Button>生成发布包</Button></header>
+      <header className="page-heading"><div><small>RELEASE BATCH / TAXONOMY</small><h1>发布批次与标签</h1><p>按案件问题、辖区和披露对象组织文档；内容改动后批次发布资格立即失效并重算。</p></div><Button disabled={!canRelease}>{canRelease ? '生成发布包' : '批次未可发布'}</Button></header>
       <div className="batch-layout">
-        <Card className="batch-list"><div className="card-title"><Layers3 size={17} /><strong>发布批次</strong></div>{['第一批披露 · 审阅中', '第二批披露 · 编制中', '专家材料 · 待补充'].map((name, index) => <button key={name} className={index === 0 ? 'active' : ''}><span>BATCH-{String(index + 1).padStart(2, '0')}</span><strong>{name}</strong><small>{[48, 79, 19][index]} 份文档</small></button>)}</Card>
-        <Card className="batch-content">
-          <div className="card-title"><Tags size={17} /><strong>文档与案件问题映射</strong><span>{selected.length} 已选择</span></div>
-          <div className="batch-table">
-            {documents.map((doc) => <label key={doc.id} className="batch-row"><input type="checkbox" checked={selected.includes(doc.id)} onChange={() => setSelected((ids) => ids.includes(doc.id) ? ids.filter((id) => id !== doc.id) : [...ids, doc.id])} /><FileText size={17} /><div><strong>{doc.title}</strong><span>{doc.id} · {doc.issue}</span></div><Badge tone={doc.status === '可发布' ? 'green' : 'amber'}>{doc.status}</Badge></label>)}
-          </div>
-          <div className="tag-editor"><h3>标签与分发级</h3><div className="tag-options">{(['合同问题', '设备缺陷', '现场安全', '损害赔偿', '仅律师可见']).map((tag, index) => <span key={tag} className={index < 3 ? 'selected' : ''}>{tag}</span>)}</div><label>导出清单说明<textarea defaultValue="按案卷编号升序导出，保留去密版本、操作者与审批时间。" /></label><Button>保存批次设置</Button></div>
+        <Card className="batch-list">
+          <div className="card-title"><Layers3 size={17} /><strong>发布批次</strong></div>
+          {batches.map((batch) => (
+            <button key={batch.id} className={batch.id === selectedBatchId ? 'active' : ''} onClick={() => setSelectedBatchId(batch.id)}>
+              <span>{batch.id}</span>
+              <strong>{batch.name}</strong>
+              <small>{batch.documentIds.length} 份文档 · {batch.status}</small>
+            </button>
+          ))}
         </Card>
-        <Card className="batch-summary"><div className="side-label">当前批次摘要</div><strong>{activeDoc.bundle}</strong><dl><div><dt>文档</dt><dd>{selected.length}</dd></div><div><dt>页数</dt><dd>{selected.reduce((sum, id) => sum + (documents.find((doc) => doc.id === id)?.pages ?? 0), 0)}</dd></div><div><dt>风险项</dt><dd>4</dd></div></dl><div className="summary-note"><AlertTriangle size={15} /><span>发布前仍需完成 4 项双人复核。</span></div></Card>
+        <Card className="batch-content">
+          <div className="card-title"><Tags size={17} /><strong>文档与案件问题映射</strong><span>{batchDocs.length} 份</span></div>
+          <div className="batch-table">
+            {batchDocs.map((doc) => (
+              <div className="batch-row" key={doc.id}>
+                <FileText size={17} />
+                <div><strong>{doc.title}</strong><span>{doc.id} · {doc.issue} · {formatVersion(doc.version)}</span></div>
+                <Badge tone={doc.status === '可发布' ? 'green' : doc.status === '待质检' ? 'amber' : 'blue'}>{doc.status}</Badge>
+              </div>
+            ))}
+            {batchDocs.length === 0 && <p className="muted empty-batch">本批次暂无文档。</p>}
+          </div>
+          <div className="tag-editor">
+            <h3>标签与分发级</h3>
+            <div className="tag-options">{(['合同问题', '设备缺陷', '现场安全', '损害赔偿', '仅律师可见']).map((tag, index) => <span key={tag} className={index < 3 ? 'selected' : ''}>{tag}</span>)}</div>
+            <label>导出清单说明<textarea defaultValue="按案卷编号升序导出，保留去密版本、操作者与审批时间。" /></label>
+            <Button>保存批次设置</Button>
+          </div>
+        </Card>
+        <Card className="batch-summary">
+          <div className="side-label">当前批次摘要</div>
+          <strong>{selectedBatch.name}</strong>
+          <dl>
+            <div><dt>文档</dt><dd>{batchDocs.length}</dd></div>
+            <div><dt>页数</dt><dd>{batchDocs.reduce((sum, doc) => sum + doc.pages, 0)}</dd></div>
+            <div><dt>版本</dt><dd>{batchDocs.map((d) => `${d.id} ${formatVersion(d.version)}`).join('；') || '—'}</dd></div>
+          </dl>
+          <div className={`release-gate ${canRelease ? 'ok' : 'blocked'}`}>
+            <div className="release-gate-head">
+              <ShieldCheck size={15} />
+              <strong>{canRelease ? '发布资格已重算通过' : '发布资格未就绪'}</strong>
+            </div>
+            {blockers.length > 0 ? (
+              <ul className="blocker-list">
+                {blockers.map((b) => <li key={b}><AlertTriangle size={12} /> {b}</li>)}
+              </ul>
+            ) : (
+              <p className="gate-ok-note">全部文档已确认区域、完成质检并清理元数据，版本一致。</p>
+            )}
+          </div>
+        </Card>
       </div>
     </div>
   );
